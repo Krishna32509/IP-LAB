@@ -2,7 +2,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 # Read grayscale image
-img = cv2.imread("input.jpg", cv2.IMREAD_GRAYSCALE)
+img = cv2.imread("image.jpg", cv2.IMREAD_GRAYSCALE)
 
 # Apply histogram equalization
 equalized = cv2.equalizeHist(img)
