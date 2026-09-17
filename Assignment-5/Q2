@@ -1,0 +1,48 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read images in grayscale
+input_img = cv2.imread("input.jpg", cv2.IMREAD_GRAYSCALE)
+reference_img = cv2.imread("reference.jpg", cv2.IMREAD_GRAYSCALE)
+
+# Calculate histograms
+hist_input = cv2.calcHist([input_img], [0], None, [256], [0, 256])
+hist_reference = cv2.calcHist([reference_img], [0], None, [256], [0, 256])
+
+# Calculate CDFs
+cdf_input = hist_input.cumsum()
+cdf_reference = hist_reference.cumsum()
+
+# Normalize CDFs
+cdf_input = cdf_input / cdf_input[-1]
+cdf_reference = cdf_reference / cdf_reference[-1]
+
+# Create mapping
+mapping = np.zeros(256, dtype=np.uint8)
+
+for i in range(256):
+    mapping[i] = np.argmin(np.abs(cdf_reference - cdf_input[i]))
+
+# Apply mapping
+matched_img = cv2.LUT(input_img, mapping)
+
+# Display images
+plt.figure(figsize=(15, 5))
+
+plt.subplot(1, 3, 1)
+plt.imshow(input_img, cmap="gray")
+plt.title("Input Image")
+plt.axis("off")
+
+plt.subplot(1, 3, 2)
+plt.imshow(reference_img, cmap="gray")
+plt.title("Reference Image")
+plt.axis("off")
+
+plt.subplot(1, 3, 3)
+plt.imshow(matched_img, cmap="gray")
+plt.title("Histogram Matched Image")
+plt.axis("off")
+
+plt.show()
