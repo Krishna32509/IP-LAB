@@ -1,0 +1,107 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read input image
+image = cv2.imread(input("Enter image path: "),
+                   cv2.IMREAD_GRAYSCALE)
+
+if image is None:
+    print("Image not found!")
+    exit()
+
+# Calculate histogram
+hist = cv2.calcHist([image], [0], None, [256], [0, 256])
+
+# Total number of pixels
+total_pixels = image.size
+
+# Calculate total mean
+total_mean = np.sum(
+    np.arange(256) * hist.flatten()
+) / total_pixels
+
+# Initialize variables
+sum_background = 0
+weight_background = 0
+maximum_variance = 0
+threshold = 0
+
+# Otsu threshold calculation
+for t in range(256):
+
+    weight_background += hist[t][0]
+
+    if weight_background == 0:
+        continue
+
+    weight_foreground = total_pixels - weight_background
+
+    if weight_foreground == 0:
+        break
+
+    sum_background += t * hist[t][0]
+
+    mean_background = sum_background / weight_background
+
+    mean_foreground = (
+        total_mean * total_pixels - sum_background
+    ) / weight_foreground
+
+    # Between-class variance
+    variance = (
+        weight_background * weight_foreground *
+        (mean_background - mean_foreground) ** 2
+    )
+
+    if variance > maximum_variance:
+        maximum_variance = variance
+        threshold = t
+
+
+# Apply threshold
+segmented = np.zeros_like(image)
+
+segmented[image > threshold] = 255
+
+print("Optimal Otsu Threshold:", threshold)
+
+
+# Compare with OpenCV built-in Otsu
+opencv_threshold, opencv_segmented = cv2.threshold(
+    image, 0, 255,
+    cv2.THRESH_BINARY + cv2.THRESH_OTSU
+)
+
+print("OpenCV Otsu Threshold:", opencv_threshold)
+
+
+# Display results
+plt.figure(figsize=(12, 8))
+
+plt.subplot(2, 2, 1)
+plt.imshow(image, cmap='gray')
+plt.title("Original Grayscale Image")
+plt.axis("off")
+
+plt.subplot(2, 2, 2)
+plt.hist(image.ravel(), bins=256, range=(0, 256))
+plt.axvline(threshold, linestyle='dashed')
+plt.title("Image Histogram")
+
+plt.subplot(2, 2, 3)
+plt.imshow(segmented, cmap='gray')
+plt.title("Manual Otsu Segmentation")
+plt.axis("off")
+
+plt.subplot(2, 2, 4)
+plt.imshow(opencv_segmented, cmap='gray')
+plt.title("OpenCV Otsu Segmentation")
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+# Save segmented image
+cv2.imwrite("otsu_segmented.png", segmented)
