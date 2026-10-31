@@ -1,0 +1,52 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read input image
+image = cv2.imread(input("Enter image path: "))
+
+if image is None:
+    print("Image not found!")
+    exit()
+
+image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# Convert image to grayscale
+gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+# Define Laplacian kernel
+kernel = np.array([
+    [0, -1, 0],
+    [-1, 4, -1],
+    [0, -1, 0]
+])
+
+# Apply Laplacian filter
+laplacian = cv2.filter2D(gray, cv2.CV_64F, kernel)
+
+# Sharpen image
+sharpened = gray.astype(np.float64) + laplacian
+
+sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+
+# Display results
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 3, 1)
+plt.imshow(gray, cmap='gray')
+plt.title("Original Image")
+plt.axis("off")
+
+plt.subplot(1, 3, 2)
+plt.imshow(np.abs(laplacian), cmap='gray')
+plt.title("Laplacian Image")
+plt.axis("off")
+
+plt.subplot(1, 3, 3)
+plt.imshow(sharpened, cmap='gray')
+plt.title("Sharpened Image")
+plt.axis("off")
+
+plt.show()
+
+cv2.imwrite("laplacian_sharpened.png", sharpened)
