@@ -1,0 +1,152 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read input image
+image = cv2.imread(input("Enter image path: "),
+                   cv2.IMREAD_GRAYSCALE)
+
+if image is None:
+    print("Image not found!")
+    exit()
+
+# Convert image to float
+image = image.astype(np.uint8)
+
+# Generate salt and pepper noise
+noisy_image = image.copy()
+
+noise = np.random.rand(*image.shape)
+
+noisy_image[noise < 0.05] = 0
+noisy_image[noise > 0.95] = 255
+
+# Input window sizes
+Smin = int(input("Enter initial window size: "))
+Smax = int(input("Enter maximum window size: "))
+
+if Smin < 3 or Smin % 2 == 0 or Smax < Smin or Smax % 2 == 0:
+    print("Enter valid odd window sizes (Smin >= 3 and Smax >= Smin)")
+    exit()
+
+
+# Normal Median Filter
+median_result = cv2.medianBlur(noisy_image, Smin)
+
+
+# Adaptive Median Filter
+def adaptive_median_filter(image, Smin, Smax):
+
+    rows, cols = image.shape
+    output = np.zeros_like(image)
+
+    pad = Smax // 2
+
+    padded = np.pad(image, pad, mode='edge')
+
+    for i in range(rows):
+        for j in range(cols):
+
+            window_size = Smin
+
+            while window_size <= Smax:
+
+                p = window_size // 2
+
+                window = padded[
+                    i + pad - p : i + pad + p + 1,
+                    j + pad - p : j + pad + p + 1
+                ]
+
+                Zmin = np.min(window)
+                Zmax = np.max(window)
+                Zmed = np.median(window)
+                Zxy = padded[i + pad, j + pad]
+
+                # Stage A
+                A1 = Zmed - Zmin
+                A2 = Zmed - Zmax
+
+                if A1 > 0 and A2 < 0:
+
+                    # Stage B
+                    B1 = Zxy - Zmin
+                    B2 = Zxy - Zmax
+
+                    if B1 > 0 and B2 < 0:
+                        output[i, j] = Zxy
+                    else:
+                        output[i, j] = Zmed
+
+                    break
+
+                else:
+                    window_size += 2
+
+            else:
+                output[i, j] = Zmed
+
+    return output
+
+
+adaptive_result = adaptive_median_filter(
+    noisy_image, Smin, Smax
+)
+
+
+# Calculate PSNR
+def calculate_psnr(original, restored):
+
+    mse = np.mean(
+        (original.astype(float) - restored.astype(float)) ** 2
+    )
+
+    if mse == 0:
+        return float('inf')
+
+    return 10 * np.log10((255 ** 2) / mse)
+
+
+psnr_median = calculate_psnr(image, median_result)
+psnr_adaptive = calculate_psnr(image, adaptive_result)
+
+
+# Print PSNR values
+print("\nPSNR Comparison")
+print("------------------------")
+print("Median Filter PSNR:", psnr_median, "dB")
+print("Adaptive Median PSNR:", psnr_adaptive, "dB")
+
+
+# Display results
+plt.figure(figsize=(12, 8))
+
+images = [
+    image,
+    noisy_image,
+    median_result,
+    adaptive_result
+]
+
+titles = [
+    "Original Image",
+    "Salt and Pepper Noise",
+    "Median Filter",
+    "Adaptive Median Filter"
+]
+
+for i in range(4):
+
+    plt.subplot(2, 2, i + 1)
+    plt.imshow(images[i], cmap='gray')
+    plt.title(titles[i])
+    plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+# Save outputs
+cv2.imwrite("noisy_image.png", noisy_image)
+cv2.imwrite("median_output.png", median_result)
+cv2.imwrite("adaptive_median_output.png", adaptive_result)
