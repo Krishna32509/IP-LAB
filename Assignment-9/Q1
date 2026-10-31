@@ -1,0 +1,56 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read input image
+image = cv2.imread(input("Enter image path: "),
+                   cv2.IMREAD_GRAYSCALE)
+
+if image is None:
+    print("Image not found!")
+    exit()
+
+# Create output image
+lbp_image = np.zeros_like(image)
+
+# Apply LBP
+for i in range(1, image.shape[0] - 1):
+    for j in range(1, image.shape[1] - 1):
+
+        center = image[i, j]
+
+        neighbors = [
+            image[i-1, j-1],
+            image[i-1, j],
+            image[i-1, j+1],
+            image[i, j+1],
+            image[i+1, j+1],
+            image[i+1, j],
+            image[i+1, j-1],
+            image[i, j-1]
+        ]
+
+        binary = 0
+
+        for k in range(8):
+            if neighbors[k] >= center:
+                binary += 1 << (7-k)
+
+        lbp_image[i, j] = binary
+
+# Display results
+plt.figure(figsize=(10, 5))
+
+plt.subplot(1, 2, 1)
+plt.imshow(image, cmap='gray')
+plt.title("Original Grayscale Image")
+plt.axis("off")
+
+plt.subplot(1, 2, 2)
+plt.imshow(lbp_image, cmap='gray')
+plt.title("Local Binary Pattern")
+plt.axis("off")
+
+plt.show()
+
+cv2.imwrite("lbp_output.png", lbp_image)
