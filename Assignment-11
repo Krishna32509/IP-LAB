@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import csv
+import random
+import time
+import urllib.request
+import zipfile
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+
+
+try:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+except NameError:  # Notebook cells do not define __file__.
+    SCRIPT_DIR = Path.cwd().resolve()
+
+ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "outputs" else SCRIPT_DIR
+DEFAULT_DATA_DIR = ROOT / "data"
+DEFAULT_OUTPUT_DIR = (
+    SCRIPT_DIR / "run_results"
+    if SCRIPT_DIR.name == "outputs"
+    else SCRIPT_DIR / "outputs" / "run_results"
+)
+DATASET_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+ARCHIVE_NAME = "tiny-imagenet-200.zip"
+DEFAULT_CLASSES = ("n01443537", "n01629819", "n01641577")
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def task1_basics() -> None:
+    """Demonstrate the requested CNN operations on a 3 x 3 matrix."""
+    print("\nTASK 1 — CNN basics on a 3 x 3 matrix")
+    torch.manual_seed(11)
+    matrix = torch.randn(3, 3)
+    kernel = torch.tensor([[1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.0, -1.0]])
+    image = matrix[None, None, :, :]
+    filter_tensor = kernel[None, None, :, :]
+
+    # torch conv2d computes cross-correlation, as is standard in CNN libraries.
+    padded = nn.functional.pad(image, (1, 1, 1, 1), mode="constant", value=0)
+    convolved = nn.functional.conv2d(padded, filter_tensor)
+    relu_result = nn.functional.relu(convolved)
+    sigmoid_result = torch.sigmoid(convolved)
+    max_pooled = nn.functional.max_pool2d(image, kernel_size=2, stride=2)
+    min_pooled = -nn.functional.max_pool2d(-image, kernel_size=2, stride=2)
+    global_average = nn.functional.adaptive_avg_pool2d(image, output_size=1)
+    flattened = torch.flatten(image, start_dim=1)
+
+    dense = nn.Linear(9, 4)
+    batch_norm = nn.BatchNorm1d(4)
+    dropout = nn.Dropout(p=0.5)
+    dense.train()
+    second_example = flattened + 0.1 * torch.randn_like(flattened)
+    dense_result = dropout(batch_norm(dense(torch.cat((flattened, second_example), dim=0))))
+
+    print("Random input matrix:\n", matrix)
+    print("3 x 3 filter with P=1 convolution output:\n", convolved[0, 0])
+    print("ReLU:\n", relu_result[0, 0])
+    print("Sigmoid:\n", sigmoid_result[0, 0])
+    print("2 x 2 max pooling:\n", max_pooled[0, 0])
+    print("2 x 2 min pooling:\n", min_pooled[0, 0])
+    print("Global average pooling:", global_average.flatten().item())
+    print("Flattened shape:", tuple(flattened.shape))
+    print("Dense + batch normalization + dropout shape:", tuple(dense_result.shape))
+    print("Early stopping is implemented by EarlyStopping and used in model training.")
+
+
+class EarlyStopping:
+    """Stop after validation loss fails to improve for `patience` epochs."""
+
+    def __init__(self, patience: int = 4, min_delta: float = 1e-4) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+        self.bad_epochs = 0
+        self.best_state: Optional[Dict[str, torch.Tensor]] = None
+
+    def update(self, validation_loss: float, model: nn.Module) -> bool:
+        if validation_loss < self.best_loss - self.min_delta:
+            self.best_loss = validation_loss
+            self.bad_epochs = 0
+            self.best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        else:
+            self.bad_epochs += 1
+        return self.bad_epochs >= self.patience
+
+
+def ensure_dataset(data_dir: Path) -> Path:
+    """Download and safely extract the official Tiny ImageNet archive if absent."""
+    dataset_dir = data_dir / "tiny-imagenet-200"
+    if (dataset_dir / "train").is_dir():
+        return dataset_dir
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = data_dir / ARCHIVE_NAME
+    if not archive_path.exists():
+        print(f"Downloading Tiny ImageNet from {DATASET_URL}")
+        urllib.request.urlretrieve(DATASET_URL, archive_path)
+
+    print(f"Extracting {archive_path}")
+    with zipfile.ZipFile(archive_path) as archive:
+        base = data_dir.resolve()
+        for member in archive.infolist():
+            destination = (data_dir / member.filename).resolve()
+            if destination != base and base not in destination.parents:
+                raise RuntimeError(f"Unsafe path in dataset archive: {member.filename}")
+        archive.extractall(data_dir)
+    if not (dataset_dir / "train").is_dir():
+        raise FileNotFoundError(f"Expected training images under {dataset_dir / 'train'}")
+    return dataset_dir
+
+
+def class_names(dataset_dir: Path) -> Dict[str, str]:
+    names: Dict[str, str] = {}
+    words_file = dataset_dir / "words.txt"
+    if words_file.exists():
+        for line in words_file.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t", maxsplit=1)
+            if len(fields) == 2:
+                names[fields[0]] = fields[1].split(",", maxsplit=1)[0]
+    return names
+
+
+def choose_records(
+    dataset_dir: Path,
+    selected_classes: Sequence[str],
+    images_per_class: int = 200,
+) -> Tuple[List[Path], List[int], List[str]]:
+    train_dir = dataset_dir / "train"
+    available = sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+    if len(selected_classes) != 3 or len(set(selected_classes)) != 3:
+        raise ValueError("Select exactly three distinct class IDs with --classes.")
+    missing = [class_id for class_id in selected_classes if class_id not in available]
+    if missing:
+        raise ValueError(
+            f"Unknown class ID(s): {', '.join(missing)}. "
+            f"Available IDs include: {', '.join(available[:12])} ..."
+        )
+
+    paths: List[Path] = []
+    labels: List[int] = []
+    for label, class_id in enumerate(selected_classes):
+        images_dir = train_dir / class_id / "images"
+        if not images_dir.is_dir():
+            images_dir = train_dir / class_id
+        candidates = sorted( 
+            path for path in images_dir.iterdir()
+            if path.suffix.lower() in {".jpeg", ".jpg", ".png"}
+        )
+        if len(candidates) < images_per_class:
+            raise ValueError(
+                f"Class {class_id} has {len(candidates)} images; "
+                f"{images_per_class} are required."
+            )
+        chosen = candidates[:images_per_class]
+        paths.extend(chosen)
+        labels.extend([label] * len(chosen))
+    return paths, labels, list(selected_classes)
+
+
+@dataclass
+class ImageRecord:
+    path: Path
+    label: int
+
+
+class TinyImageNetSubset(Dataset):
+    def __init__(
+        self, 
+        records: Sequence[ImageRecord],
+        image_size: int,
+        training: bool,
+    ) -> None:
+        self.records = records
+        steps = [transforms.Resize((image_size, image_size))]
+        if training:
+            steps.append(transforms.RandomHorizontalFlip(p=0.5))
+        steps.extend([
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+        self.transform = transforms.Compose(steps)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
+        record = self.records[index]
+        with Image.open(record.path) as source:
+            image = source.convert("RGB")
+        return self.transform(image), record.label
+
+
+def make_splits(
+    paths: Sequence[Path], labels: Sequence[int], seed: int
+) -> Tuple[List[ImageRecord], List[ImageRecord], List[ImageRecord]]:
+    indices = np.arange(len(paths))
+    train_idx, remainder_idx = train_test_split(
+        indices, test_size=0.30, random_state=seed, stratify=labels
+    )
+    val_idx, test_idx = train_test_split(
+        remainder_idx,
+        test_size=0.50,
+        random_state=seed,
+        stratify=np.asarray(labels)[remainder_idx],
+    )
+
+    def records(idxs: Sequence[int]) -> List[ImageRecord]:
+        return [ImageRecord(paths[int(i)], int(labels[int(i)])) for i in idxs]
+
+    return records(train_idx), records(val_idx), records(test_idx)
+
+
+class CustomCNN(nn.Module):
+    """A small CNN using convolution, padding, ReLU, pooling, BN, GAP, and dropout."""
+
+    def __init__(self, num_classes: int) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.35),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.pool(self.features(x)))
+
+
+class TransferModel(nn.Module):
+    """Keep frozen feature extractors in evaluation mode, including their BN layers."""
+
+    def train(self, mode: bool = True) -> "TransferModel":
+        super().train(mode)
+        if not any(parameter.requires_grad for parameter in self.features.parameters()):
+            self.features.eval()
+        return self
+
+
+class VGG16Transfer(TransferModel):
+    def __init__(self, num_classes: int, pretrained: bool) -> None:
+        super().__init__()
+        weights = models.VGG16_Weights.DEFAULT if pretrained else None
+        base = models.vgg16(weights=weights)
+        self.features = base.features
+        for parameter in self.features.parameters():
+            parameter.requires_grad = False
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(), nn.Dropout(0.25), nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.pool(self.features(x)))
+
+
+class MobileNetTransfer(TransferModel):
+    def __init__(self, num_classes: int, pretrained: bool) -> None:
+        super().__init__()
+        weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+        base = models.mobilenet_v3_small(weights=weights)
+        self.features = base.features
+        for parameter in self.features.parameters():
+            parameter.requires_grad = False
+        channels = base.classifier[0].in_features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(), nn.Dropout(0.25), nn.Linear(channels, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.pool(self.features(x)))
+
+
+class ResNet18Transfer(TransferModel):
+    def __init__(self, num_classes: int, pretrained: bool) -> None:
+        super().__init__()
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        base = models.resnet18(weights=weights)
+        self.features = nn.Sequential(*list(base.children())[:-2])
+        for parameter in self.features.parameters():
+            parameter.requires_grad = False
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(), nn.Dropout(0.25), nn.Linear(base.fc.in_features, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.pool(self.features(x)))
+
+
+MODEL_BUILDERS = { 
+    "custom": lambda n, pretrained: CustomCNN(n),
+    "vgg16": VGG16Transfer,
+    "mobilenet": MobileNetTransfer,
+    "resnet18": ResNet18Transfer,
+}
+
+
+def select_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+) -> Tuple[float, List[int], List[int]]:
+    training = optimizer is not None
+    model.train(training)
+    loss_total = 0.0
+    targets_all: List[int] = []
+    predictions_all: List[int] = []
+    for images, targets in loader:
+        images = images.to(device)
+        targets = targets.to(device)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(training):
+            logits = model(images)
+            loss = criterion(logits, targets)
+            if training:
+                loss.backward()
+                optimizer.step()
+        loss_total += float(loss.item()) * images.size(0)
+        predictions = logits.argmax(dim=1)
+        targets_all.extend(targets.detach().cpu().tolist())
+        predictions_all.extend(predictions.detach().cpu().tolist())
+    return loss_total / len(loader.dataset), targets_all, predictions_all
+
+
+def plot_history(history: Dict[str, List[float]], model_name: str, output_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(epochs, history["train_loss"], marker="o", label="Training loss")
+    ax.plot(epochs, history["val_loss"], marker="o", label="Validation loss")
+    ax.set(title=f"{model_name}: training and validation loss", xlabel="Epoch", ylabel="Cross-entropy loss")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{model_name}_loss.png", dpi=160)
+    plt.close(fig)
+
+
+def fit_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    patience: int,
+    learning_rate: float,
+    fine_tune: bool,
+) -> Dict[str, List[float]]:
+    if fine_tune:
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    stopper = EarlyStopping(patience=patience)
+    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(1, epochs + 1):
+        train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer)
+        val_loss, _, _ = run_epoch(model, val_loader, criterion, device)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        print(
+            f"  epoch {epoch:02d}/{epochs}: "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f}"
+        )
+        if stopper.update(val_loss, model):
+            print(f"  early stopping after epoch {epoch}; best val loss={stopper.best_loss:.4f}")
+            break
+
+    if stopper.best_state is not None:
+        model.load_state_dict(stopper.best_state)
+    return history
+
+
+def evaluate(
+    model: nn.Module, loader: DataLoader, device: torch.device
+) -> Dict[str, float]:
+    criterion = nn.CrossEntropyLoss()
+    _, y_true, y_pred = run_epoch(model, loader, criterion, device)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(precision),
+        "recall_macro": float(recall),
+        "f1_macro": float(f1),
+    }
+
+
+def save_metrics(metrics: Dict[str, Dict[str, float]], output_dir: Path) -> None:
+    path = output_dir / "test_metrics.csv"
+    columns = ["model", "accuracy", "precision_macro", "recall_macro", "f1_macro"]
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        for model_name, scores in metrics.items():
+            writer.writerow({"model": model_name, **scores})
+
+
+def print_class_choices(dataset_dir: Path) -> None:
+    names = class_names(dataset_dir)
+    ids = sorted(path.name for path in (dataset_dir / "train").iterdir() if path.is_dir())
+    print("Available class IDs (first 30):")
+    for class_id in ids[:30]:
+        print(f"  {class_id}: {names.get(class_id, 'name unavailable')}")
+    if len(ids) > 30:
+        print(f"  ... and {len(ids) - 30} more")
+
+
+def run_experiments(args: argparse.Namespace) -> None:
+    seed_everything(args.seed)
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = ensure_dataset(data_dir)
+
+    selected_classes = tuple(item.strip() for item in args.classes.split(",") if item.strip())
+    if len(selected_classes) != 3 or len(set(selected_classes)) != 3:
+        print_class_choices(dataset_dir)
+        raise ValueError("Pass exactly three distinct comma-separated class IDs using --classes.")
+    paths, labels, selected_classes = choose_records(dataset_dir, selected_classes)
+    train_records, val_records, test_records = make_splits(paths, labels, args.seed)
+    names = class_names(dataset_dir)
+    print("\nDataset selection and split")
+    for class_id in selected_classes:
+        print(f"  {class_id}: {names.get(class_id, 'name unavailable')} — 200 images")
+    print(f"  total={len(paths)}; train={len(train_records)}; val={len(val_records)}; test={len(test_records)}")
+    print("  split is stratified; each class contributes 140/30/30 images.")
+
+    device = select_device()
+    print(f"\nDevice: {device}; pretrained weights: {not args.scratch}")
+    metric_rows: Dict[str, Dict[str, float]] = {}
+    start_time = time.time()
+
+    for model_name in args.models:
+        print(f"\nTraining {model_name}")
+        image_size = 64 if model_name == "custom" else args.transfer_size
+        train_data = TinyImageNetSubset(train_records, image_size=image_size, training=True)
+        val_data = TinyImageNetSubset(val_records, image_size=image_size, training=False)
+        test_data = TinyImageNetSubset(test_records, image_size=image_size, training=False)
+        train_loader = DataLoader(
+            train_data, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        )
+        val_loader = DataLoader(
+            val_data, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        )
+        test_loader = DataLoader(
+            test_data, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        )
+
+        model = MODEL_BUILDERS[model_name](len(selected_classes), not args.scratch).to(device)
+        fine_tune_model = args.fine_tune and model_name != "custom"
+        lr = args.fine_tune_lr if fine_tune_model else args.learning_rate
+        history = fit_model(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=args.epochs,
+            patience=args.patience,
+            learning_rate=lr,
+            fine_tune=fine_tune_model,
+        )
+        plot_history(history, model_name, output_dir)
+        scores = evaluate(model, test_loader, device)
+        metric_rows[model_name] = scores
+        torch.save(model.state_dict(), output_dir / f"{model_name}_best.pt")
+        print(
+            "  test: "
+            + " | ".join(f"{key}={value:.4f}" for key, value in scores.items())
+        )
+
+    save_metrics(metric_rows, output_dir)
+    elapsed = (time.time() - start_time) / 60
+    print(f"\nSaved comparison to {output_dir / 'test_metrics.csv'}")
+    print(f"Saved loss plots and model weights in {output_dir}")
+    print(f"Training time: {elapsed:.1f} minutes")
+    print("\nReading the custom CNN curve:")
+    print("  Overfitting is suggested when training loss keeps falling while validation loss rises.")
+    print("  Underfitting is suggested when both losses remain high and change little.")
+    print("  Early stopping restores the weights from the epoch with lowest validation loss.")
+
+
+def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", choices=("basics", "train", "all"), default="all")
+    parser.add_argument(
+        "--classes", default=",".join(DEFAULT_CLASSES),
+        help="Exactly three Tiny ImageNet wnids, comma-separated.",
+    )
+    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--models", nargs="+", choices=tuple(MODEL_BUILDERS),
+                        default=["custom", "vgg16", "mobilenet", "resnet18"])
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--patience", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--transfer-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--fine-tune-lr", type=float, default=1e-5)
+    parser.add_argument("--fine-tune", action="store_true",
+                        help="Also train the pretrained feature extractors at a low learning rate.")
+    parser.add_argument("--scratch", action="store_true",
+                        help="Initialize transfer architectures without downloading pretrained weights.")
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=11)
+    return parser.parse_args(args=args)
+
+
+def main() -> None:
+    # If running inside a notebook, ignore notebook arguments passed to the kernel
+    if any("ipykernel_launcher" in arg or "colab_kernel_launcher" in arg for arg in sys.argv):
+        args = parse_args(args=[])
+    else:
+        args = parse_args()
+        
+    if args.task in ("basics", "all"):
+        task1_basics()
+    if args.task in ("train", "all"):
+        run_experiments(args)
+
+
+if __name__ == "__main__":
+    main()
